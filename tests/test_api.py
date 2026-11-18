@@ -140,3 +140,72 @@ def test_notifier_fault_modes_and_lookup(tmp_path, notifier):
 
         bad = http.post("/api/fault", json={"mode": "nonsense"})
         assert bad.status_code == 400
+
+
+def test_api_cleanup_round_and_conflicts(tmp_path, notifier):
+    client, service = make_client(tmp_path, notifier)
+    with client:
+        created = client.post("/api/alarm/trigger").json()
+        # Active round cannot be cleaned.
+        blocked = client.post(f"/api/rounds/{created['id']}/cleanup")
+        assert blocked.status_code == 409
+        client.post("/api/tick")
+        client.post("/api/alarm/recover")
+
+        state = client.get("/api/state").json()
+        row = next(r for r in state["rounds"] if r["id"] == created["id"])
+        assert row["is_cleanable"] is True
+
+        result = client.post(f"/api/rounds/{created['id']}/cleanup")
+        assert result.status_code == 200
+        body = result.json()
+        assert body["complete"] is True
+
+        state = client.get("/api/state").json()
+        assert all(r["id"] != created["id"] for r in state["rounds"])
+        assert client.post("/api/rounds/999/cleanup").status_code == 404
+
+        # Retrying a finished cleanup stays successful and idempotent.
+        again = client.post(f"/api/rounds/{created['id']}/cleanup/retry")
+        assert again.status_code == 200
+        assert again.json()["complete"] is True
+    service.close()
+
+
+def test_api_cleanup_reports_notifier_outage_then_retry(tmp_path, notifier):
+    _store, url = notifier
+    client, service = make_client(tmp_path, notifier)
+    with client:
+        created = client.post("/api/alarm/trigger").json()
+        client.post("/api/tick")
+        client.post("/api/alarm/recover")
+
+        service._client.base_url = "http://127.0.0.1:1"
+        failed = client.post(f"/api/rounds/{created['id']}/cleanup")
+        assert failed.status_code == 200
+        body = failed.json()
+        assert body["complete"] is False
+        assert body["cleanup_error"]
+
+        state = client.get("/api/state").json()
+        row = next(r for r in state["rounds"] if r["id"] == created["id"])
+        assert row["state"] == "cleaning"
+        assert row["group"] == "cleaning"
+        assert state["counts"]["sent"] == 0
+        assert state["counts"]["cleaning"] == 1
+
+        service._client.base_url = url
+        done = client.post(f"/api/rounds/{created['id']}/cleanup/retry")
+        assert done.json()["complete"] is True
+        assert client.get("/api/state").json()["counts"]["cleaning"] == 0
+    service.close()
+
+
+def test_api_page_exposes_cleanup_controls(tmp_path, notifier):
+    client, service = make_client(tmp_path, notifier)
+    with client:
+        page = client.get("/").text
+        assert "清理" in page
+        js = client.get("/static/app.js").text
+        assert "/cleanup" in js
+    service.close()

@@ -74,6 +74,17 @@ class NotifierStore:
                 )
                 """
             )
+            # Retired numbers are kept as tombstones only: the acceptance record
+            # itself is deleted, but a cleaned number can never be issued again.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cleaned_notifications (
+                    notification_no TEXT PRIMARY KEY,
+                    round_id INTEGER NOT NULL,
+                    cleaned_at REAL NOT NULL
+                )
+                """
+            )
             row = conn.execute(
                 "SELECT value FROM settings WHERE key = 'mode'"
             ).fetchone()
@@ -113,11 +124,34 @@ class NotifierStore:
     def accept(self, item: NotifyIn) -> dict[str, Any]:
         now = time.time()
         with self._lock, self._db() as conn:
+            tombstone = conn.execute(
+                "SELECT round_id FROM cleaned_notifications WHERE notification_no = ?",
+                (item.notification_no,),
+            ).fetchone()
+            if tombstone is not None:
+                # A cleaned number is retired forever; a stale round must not be
+                # resurrected on the notifier side either.
+                return {
+                    "accepted": False,
+                    "conflict": "cleaned",
+                    "detail": "该通知号已随轮次清理，不能再投递",
+                }
             existing = conn.execute(
                 "SELECT * FROM notifications WHERE notification_no = ?",
                 (item.notification_no,),
             ).fetchone()
             if existing is not None:
+                if (
+                    existing["round_id"] is not None
+                    and item.round_id is not None
+                    and int(existing["round_id"]) != int(item.round_id)
+                ):
+                    # Same number, different round: never treat it as this round's receipt.
+                    return {
+                        "accepted": False,
+                        "conflict": "round_mismatch",
+                        "detail": "该通知号已属于另一轮，不能当作本轮受理",
+                    }
                 conn.execute(
                     "UPDATE notifications SET deliveries = deliveries + 1 WHERE notification_no = ?",
                     (item.notification_no,),
@@ -143,6 +177,62 @@ class NotifierStore:
             )
             return {"accepted": True, "accepted_at": now, "duplicate": False}
 
+    def clean(self, notification_no: str, round_id: int) -> dict[str, Any]:
+        """Delete the acceptance record for exactly this round, idempotently.
+
+        A number is only removed when its stored round_id matches. A tombstone
+        keeps the retired number from ever being reused, and makes retries after
+        a partial failure / notifier restart safe.
+        """
+        now = time.time()
+        with self._lock, self._db() as conn:
+            existing = conn.execute(
+                "SELECT * FROM notifications WHERE notification_no = ?",
+                (notification_no,),
+            ).fetchone()
+            if existing is not None:
+                if existing["round_id"] is None or int(existing["round_id"]) != int(round_id):
+                    return {
+                        "deleted": False,
+                        "reason": "round_mismatch",
+                        "detail": "通知端同号记录不属于该轮，未删除",
+                    }
+                deleted = conn.execute(
+                    "DELETE FROM notifications WHERE notification_no = ? AND round_id = ?",
+                    (notification_no, round_id),
+                ).rowcount
+                conn.execute(
+                    """
+                    INSERT INTO cleaned_notifications(notification_no, round_id, cleaned_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(notification_no) DO UPDATE SET
+                        round_id = excluded.round_id,
+                        cleaned_at = excluded.cleaned_at
+                    """,
+                    (notification_no, round_id, now),
+                )
+                return {"deleted": bool(deleted), "already_cleaned": False, "existed": True}
+            tombstone = conn.execute(
+                "SELECT round_id FROM cleaned_notifications WHERE notification_no = ?",
+                (notification_no,),
+            ).fetchone()
+            if tombstone is not None:
+                if int(tombstone["round_id"]) != int(round_id):
+                    return {
+                        "deleted": False,
+                        "reason": "round_mismatch",
+                        "detail": "该通知号已作为另一轮清理，不能当成本轮记录",
+                    }
+                return {"deleted": True, "already_cleaned": True, "existed": False}
+            # Nothing was ever accepted for this round (skipped/cancelled/never sent).
+            # Retire the number anyway so a retry is idempotent and it cannot be reused.
+            conn.execute(
+                "INSERT INTO cleaned_notifications(notification_no, round_id, cleaned_at) "
+                "VALUES (?, ?, ?)",
+                (notification_no, round_id, now),
+            )
+            return {"deleted": True, "already_cleaned": False, "existed": False}
+
     def lookup(self, notification_no: str) -> dict[str, Any] | None:
         with self._lock, self._db() as conn:
             row = conn.execute(
@@ -150,6 +240,15 @@ class NotifierStore:
                 (notification_no,),
             ).fetchone()
             return dict(row) if row else None
+
+    def is_cleaned(self, notification_no: str) -> int | None:
+        """Return the round_id that retired this number, if any."""
+        with self._lock, self._db() as conn:
+            row = conn.execute(
+                "SELECT round_id FROM cleaned_notifications WHERE notification_no = ?",
+                (notification_no,),
+            ).fetchone()
+            return int(row["round_id"]) if row is not None else None
 
     def recent(self, limit: int = 50) -> list[dict[str, Any]]:
         with self._lock, self._db() as conn:
@@ -189,6 +288,9 @@ def create_app(store: NotifierStore | None = None) -> FastAPI:
         if not item.notification_no.strip():
             return JSONResponse(status_code=422, content={"accepted": False})
         result = store.accept(item)
+        if result.get("accepted") is not True:
+            logger.info("conflict %s (%s)", item.notification_no, result.get("conflict"))
+            return JSONResponse(status_code=409, content=result)
         if mode == "drop_receipt":
             logger.info("accepted %s then dropping receipt (fault mode)", item.notification_no)
             return JSONResponse(
@@ -219,6 +321,21 @@ def create_app(store: NotifierStore | None = None) -> FastAPI:
     @app.get("/api/notifications")
     def list_notifications(request: Request) -> list[dict[str, Any]]:
         return request.app.state.store.recent()
+
+    @app.post("/notifications/{notification_no}/clean")
+    def clean(notification_no: str, request: Request, round_id: int) -> JSONResponse:
+        """Remove this round's acceptance record; idempotent for safe retries."""
+        result = request.app.state.store.clean(notification_no, round_id)
+        status = 200 if result.get("deleted") else 409
+        return JSONResponse(status_code=status, content=result)
+
+    @app.get("/notifications/{notification_no}/cleaned")
+    def cleaned(notification_no: str, request: Request) -> JSONResponse:
+        round_id = request.app.state.store.is_cleaned(notification_no)
+        return JSONResponse(
+            status_code=200,
+            content={"notification_no": notification_no, "cleaned": round_id is not None, "round_id": round_id},
+        )
 
     @app.post("/api/fault")
     def set_fault(body: FaultIn, request: Request) -> dict[str, Any]:

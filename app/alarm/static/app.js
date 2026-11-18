@@ -108,24 +108,27 @@ function render(state) {
   $("#set-maint").disabled = busy;
 
   const c = state.counts;
-  const values = [c.suppressed, c.pending, c.sent, c.skipped, c.cancelled];
+  const values = [c.suppressed, c.pending, c.sent, c.skipped, c.cancelled, c.cleaning];
   document.querySelectorAll("#stats .stat .n").forEach((el, idx) => {
-    el.textContent = values[idx];
+    el.textContent = values[idx] ?? 0;
   });
 
   const tbody = $("#rounds tbody");
   tbody.innerHTML = "";
   for (const r of state.rounds) {
     const tr = document.createElement("tr");
-    const deliveryCell = r.state === "sent"
-      ? `已受理 ${fmtTime(r.accepted_at)}`
-      : r.state === "delivering"
-        ? "投递中…"
-        : r.needs_verify
-          ? "待按通知号核实"
-          : r.state === "pending"
-            ? "等待投递"
-            : "—";
+    if (r.cleanup_error) tr.classList.add("cleanup-failed");
+    const deliveryCell = r.state === "cleaning"
+      ? "清理中…"
+      : r.state === "sent"
+        ? `已受理 ${fmtTime(r.accepted_at)}`
+        : r.state === "delivering"
+          ? "投递中…"
+          : r.needs_verify
+            ? "待按通知号核实"
+            : r.state === "pending"
+              ? "等待投递"
+              : "—";
     const cells = [
       `<b>#${r.id}</b>`,
       `<span class="mono">${r.notification_no}</span>`,
@@ -150,9 +153,54 @@ function render(state) {
       err.textContent = `错误：${r.last_error}`;
       noteTd.appendChild(err);
     }
+    if (r.cleanup_error) {
+      const err = document.createElement("div");
+      err.className = "mono";
+      err.style.color = "var(--red)";
+      err.textContent = `清理未完成：${r.cleanup_error}`;
+      noteTd.appendChild(err);
+    }
+
+    const cleanTd = document.createElement("td");
+    cleanTd.className = "cleanup";
+    const btn = document.createElement("button");
+    btn.className = "btn small";
+    if (r.state === "cleaning") {
+      btn.textContent = r.cleanup_error ? "清理未完成 · 重试" : "重试清理";
+      btn.classList.add("warn");
+      btn.disabled = busy;
+      btn.addEventListener("click", () => runCleanup(r, true));
+    } else if (r.is_cleanable) {
+      btn.textContent = "清理";
+      btn.addEventListener("click", () => runCleanup(r, false));
+    } else {
+      btn.textContent = "不可清理";
+      btn.disabled = true;
+      btn.title = r.cleanup_block_reason || "";
+    }
+    cleanTd.appendChild(btn);
+    tr.appendChild(cleanTd);
     tbody.appendChild(tr);
   }
   $("#empty").classList.toggle("hidden", state.rounds.length > 0);
+}
+
+function runCleanup(r, retry) {
+  const message = retry
+    ? `重试清理第 ${r.id} 轮（${r.notification_no}）？\n该轮已停止投递；将再次尝试删除告警端与通知端记录。`
+    : `清理第 ${r.id} 轮（${r.notification_no}）？\n将删除告警端该轮记录及通知端对应受理记录，且该通知号不再复用。`;
+  if (!confirm(message)) return;
+  perform(async () => {
+    const path = retry
+      ? `/api/rounds/${r.id}/cleanup/retry`
+      : `/api/rounds/${r.id}/cleanup`;
+    const res = await api(path, { method: "POST" });
+    if (res.complete) {
+      toast(`第 ${r.id} 轮已清理，通知号 ${res.notification_no || r.notification_no} 不再复用`);
+    } else {
+      toast(`第 ${r.id} 轮清理未完成：${res.cleanup_error}；通知端恢复后可重试`, true);
+    }
+  });
 }
 
 async function refresh() {

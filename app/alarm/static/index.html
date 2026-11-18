@@ -58,12 +58,13 @@
     <div class="stat sent"><span class="n">0</span><span class="t">已送</span></div>
     <div class="stat skipped"><span class="n">0</span><span class="t">未补送</span></div>
     <div class="stat cancelled"><span class="n">0</span><span class="t">已取消</span></div>
+    <div class="stat cleaning"><span class="n">0</span><span class="t">清理中</span></div>
   </section>
 
   <section class="card table-card">
     <div class="card-head">
       <h2>告警轮次</h2>
-      <span class="muted">每轮固定通知号 · 回执丢失先按号核实 · 不重复通知</span>
+      <span class="muted">每轮固定通知号 · 回执丢失先按号核实 · 不重复通知 · 已恢复且结果确定的轮次可清理</span>
     </div>
     <div class="table-wrap">
       <table id="rounds">
@@ -77,6 +78,7 @@
             <th>送达 / 核实</th>
             <th>尝试</th>
             <th>说明</th>
+            <th>清理</th>
           </tr>
         </thead>
         <tbody></tbody>

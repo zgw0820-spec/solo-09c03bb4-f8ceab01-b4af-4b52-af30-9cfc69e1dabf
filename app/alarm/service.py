@@ -21,6 +21,7 @@ STATE_LABELS = {
     "sent": "已送",
     "skipped": "未补送",
     "cancelled": "已取消",
+    "cleaning": "清理中",
 }
 
 GROUP_OF_STATE = {
@@ -30,7 +31,10 @@ GROUP_OF_STATE = {
     "sent": "sent",
     "skipped": "skipped",
     "cancelled": "cancelled",
+    "cleaning": "cleaning",
 }
+
+CLEANABLE_STATES = {"sent", "skipped", "cancelled"}
 
 
 class AlarmConflict(Exception):
@@ -39,6 +43,10 @@ class AlarmConflict(Exception):
 
 class AlarmBadRequest(Exception):
     """Invalid input for an alarm operation."""
+
+
+class AlarmNotFound(Exception):
+    """The requested alarm round does not exist."""
 
 
 class NotifyOutcome:
@@ -90,6 +98,15 @@ class NotifierClient:
                     duplicate=bool(data.get("duplicate")),
                 )
             return NotifyOutcome("unknown", detail="通知端未确认受理")
+        if resp.status_code == 409:
+            detail = "通知端拒绝该通知号"
+            try:
+                data = resp.json()
+                if isinstance(data.get("detail"), str):
+                    detail = data["detail"]
+            except ValueError:
+                pass
+            return NotifyOutcome("rejected", detail=detail)
         return NotifyOutcome("unknown", detail=f"通知端 HTTP {resp.status_code}")
 
     def verify(self, notification_no: str) -> NotifyOutcome:
@@ -117,6 +134,34 @@ class NotifierClient:
                 )
             return NotifyOutcome("not_found", detail="通知端记录未受理")
         return NotifyOutcome("unknown", detail=f"核实请求 HTTP {resp.status_code}")
+
+    def clean(self, notification_no: str, round_id: int) -> NotifyOutcome:
+        """Ask the notifier to delete this round's record.
+
+        Idempotent: a number already retired for the same round counts as deleted.
+        A same-number record belonging to another round is reported as mismatch
+        and must never be removed.
+        """
+        try:
+            resp = httpx.post(
+                f"{self.base_url}/notifications/{notification_no}/clean",
+                params={"round_id": round_id},
+                timeout=self._timeout(),
+            )
+        except httpx.HTTPError as exc:
+            return NotifyOutcome("unknown", detail=f"通知端清理请求失败（{type(exc).__name__}）")
+        if resp.status_code == 200:
+            return NotifyOutcome("deleted", detail="通知端记录已删除")
+        if resp.status_code == 409:
+            detail = "通知端同号记录不属于该轮"
+            try:
+                data = resp.json()
+                if isinstance(data.get("detail"), str):
+                    detail = data["detail"]
+            except ValueError:
+                pass
+            return NotifyOutcome("mismatch", detail=detail)
+        return NotifyOutcome("unknown", detail=f"通知端清理请求 HTTP {resp.status_code}")
 
 
 class AlarmService:
@@ -206,6 +251,28 @@ class AlarmService:
                 )
                 """
             )
+            # Added for per-round cleanup. Existing databases are migrated below.
+            columns = {
+                str(row["name"])
+                for row in conn.execute("PRAGMA table_info(alarm_rounds)").fetchall()
+            }
+            if "prior_state" not in columns:
+                conn.execute("ALTER TABLE alarm_rounds ADD COLUMN prior_state TEXT")
+            if "cleanup_error" not in columns:
+                conn.execute("ALTER TABLE alarm_rounds ADD COLUMN cleanup_error TEXT")
+            if "cleanup_attempted_at" not in columns:
+                conn.execute("ALTER TABLE alarm_rounds ADD COLUMN cleanup_attempted_at REAL")
+            # A cleaned notification number is retired forever and may never be
+            # issued to a new alarm, even though the round record itself is gone.
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS retired_notifications (
+                    notification_no TEXT PRIMARY KEY,
+                    round_id INTEGER NOT NULL,
+                    cleaned_at REAL NOT NULL
+                )
+                """
+            )
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_alarm_rounds_state ON alarm_rounds(state)"
             )
@@ -246,6 +313,23 @@ class AlarmService:
                     changed,
                     cancelled,
                 )
+            # A crash between marking 'cleaning' and finishing the two-sided delete
+            # must be visible as an incomplete cleanup, and retryable.
+            stuck = conn.execute(
+                """
+                UPDATE alarm_rounds
+                   SET cleanup_error = COALESCE(
+                           cleanup_error,
+                           '服务重启时清理尚未完成，请重试'
+                       ),
+                       note = '清理未完成：服务重启中断了删除；恢复后可重试，完成前不会再投递',
+                       updated_at = ?
+                 WHERE state = 'cleaning'
+                """,
+                (now,),
+            ).rowcount
+            if stuck:
+                logger.info("startup recovery: %s cleanup(s) left incomplete", stuck)
         self._expire_windows_locked(now)
 
     # ---------- state machine (call with lock held) ----------
@@ -512,6 +596,11 @@ class AlarmService:
             "message": "供电柜过热告警",
         }
         outcome = self._client.notify(payload)
+        if outcome.kind == "rejected":
+            # The notifier refused this number outright (e.g. it was already
+            # retired by a cleanup): retrying can never succeed.
+            self._cancel(round_id, f"通知被拒绝：{outcome.detail}；本轮不再投递")
+            return
         if outcome.kind == "accepted":
             note = "通知端已受理"
             if outcome.duplicate:
@@ -711,7 +800,7 @@ class AlarmService:
                     ),
                 )
                 round_id = int(cur.lastrowid)
-                notification_no = f"ALM-{round_id:06d}"
+                notification_no = self._allocate_notification_no(conn, round_id)
                 conn.execute(
                     "UPDATE alarm_rounds SET notification_no = ? WHERE id = ?",
                     (notification_no, round_id),
@@ -778,6 +867,210 @@ class AlarmService:
                 ).fetchone()
             return self._round_dict(updated)
 
+    # ---------- per-round cleanup ----------
+    #
+    # Cleanup is deliberately two-sided and idempotent. The alarm row stays in
+    # 'cleaning' until the notifier confirms deletion, so a partial failure (or a
+    # crash between the two deletes) is visible on the page and retryable. The
+    # retired number is recorded so no new alarm can ever reuse it.
+
+    def _cleanup_payload(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "round_id": int(row["id"]),
+            "notification_no": row["notification_no"],
+            "prior_state": row["prior_state"],
+            "cleanup_error": row["cleanup_error"],
+            "state": row["state"],
+        }
+
+    def _allocate_notification_no(self, conn: sqlite3.Connection, round_id: int) -> str:
+        """Pick a number that has never been used, including by cleaned rounds."""
+        suffix = round_id
+        while True:
+            candidate = f"ALM-{suffix:06d}"
+            taken = conn.execute(
+                "SELECT 1 FROM alarm_rounds WHERE notification_no = ? "
+                "UNION ALL SELECT 1 FROM retired_notifications WHERE notification_no = ? "
+                "LIMIT 1",
+                (candidate, candidate),
+            ).fetchone()
+            if taken is None:
+                return candidate
+            suffix += 1
+
+    def cleanup_block_reason(self, row: sqlite3.Row) -> str | None:
+        """Return why a round may not be cleaned, or None if it is cleanable."""
+        state = str(row["state"])
+        if state == "cleaning":
+            return None
+        if state not in CLEANABLE_STATES:
+            return "只有已恢复且送达结果确定的轮次可以清理"
+        if row["recovered_at"] is None:
+            return "告警尚未恢复，不能清理"
+        if row["needs_verify"]:
+            return "送达结果仍在核实，不能清理"
+        if state == "sent" and row["accepted_at"] is None:
+            return "送达结果尚未确定，不能清理"
+        return None
+
+    def start_cleanup(self, round_id: int) -> dict[str, Any]:
+        """Start (or retry) cleanup of one round on both sides."""
+        now = self._clock()
+        with self._lock:
+            self._expire_windows_locked(now)
+            with self._db() as conn:
+                row = conn.execute(
+                    "SELECT * FROM alarm_rounds WHERE id = ?", (round_id,)
+                ).fetchone()
+                if row is None:
+                    # A retry after a completed cleanup: the alarm row is gone,
+                    # but the retired number proves this round finished cleanly.
+                    retired = conn.execute(
+                        "SELECT notification_no FROM retired_notifications WHERE round_id = ? "
+                        "ORDER BY cleaned_at DESC LIMIT 1",
+                        (round_id,),
+                    ).fetchone()
+                    if retired is not None:
+                        return {
+                            "round_id": round_id,
+                            "notification_no": retired["notification_no"],
+                            "prior_state": None,
+                            "deleted": True,
+                            "complete": True,
+                            "cleanup_error": None,
+                            "state": "cleaned",
+                        }
+                    raise AlarmNotFound(f"第 {round_id} 轮不存在或已清理")
+                number = str(row["notification_no"])
+                if row["state"] != "cleaning":
+                    blocked = self.cleanup_block_reason(row)
+                    if blocked is not None:
+                        label = STATE_LABELS.get(str(row["state"]), str(row["state"]))
+                        raise AlarmConflict(f"第 {round_id} 轮当前为「{label}」，{blocked}")
+                    label = STATE_LABELS.get(str(row["state"]), str(row["state"]))
+                    conn.execute(
+                        """
+                        UPDATE alarm_rounds
+                           SET state = 'cleaning',
+                               prior_state = ?,
+                               cleanup_error = NULL,
+                               cleanup_attempted_at = ?,
+                               needs_verify = 0,
+                               next_attempt_at = NULL,
+                               note = ?,
+                               updated_at = ?
+                         WHERE id = ? AND state = ?
+                        """,
+                        (
+                            str(row["state"]),
+                            now,
+                            f"值班员清理中：原状态「{label}」，正在删除告警端与通知端记录",
+                            now,
+                            round_id,
+                            str(row["state"]),
+                        ),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE alarm_rounds SET cleanup_attempted_at = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        (now, now, round_id),
+                    )
+        # Network call outside the lock. 'cleaning' rows are never claimable for
+        # delivery, so a stale round cannot be sent again while being removed.
+        outcome = self._client.clean(number, round_id)
+        return self._finalize_cleanup(round_id, outcome)
+
+    def retry_cleanup(self, round_id: int) -> dict[str, Any]:
+        return self.start_cleanup(round_id)
+
+    def _finalize_cleanup(self, round_id: int, outcome: NotifyOutcome) -> dict[str, Any]:
+        now = self._clock()
+        with self._lock:
+            with self._db() as conn:
+                row = conn.execute(
+                    "SELECT * FROM alarm_rounds WHERE id = ?", (round_id,)
+                ).fetchone()
+                if row is None:
+                    # Another cleanup may have finished the round concurrently.
+                    # Only claim success when the retired number proves it.
+                    retired = conn.execute(
+                        "SELECT notification_no FROM retired_notifications WHERE round_id = ? "
+                        "ORDER BY cleaned_at DESC LIMIT 1",
+                        (round_id,),
+                    ).fetchone()
+                    if retired is not None or outcome.kind == "deleted":
+                        return {
+                            "round_id": round_id,
+                            "notification_no": retired["notification_no"] if retired else None,
+                            "prior_state": None,
+                            "deleted": True,
+                            "complete": True,
+                            "cleanup_error": None,
+                            "state": "cleaned",
+                        }
+                    return {
+                        "round_id": round_id,
+                        "notification_no": None,
+                        "prior_state": None,
+                        "deleted": False,
+                        "complete": False,
+                        "cleanup_error": outcome.detail or "清理状态未知，请重试",
+                        "state": "cleaned",
+                    }
+                number = str(row["notification_no"])
+                if outcome.kind == "deleted":
+                    conn.execute(
+                        """
+                        INSERT INTO retired_notifications(notification_no, round_id, cleaned_at)
+                        VALUES (?, ?, ?)
+                        ON CONFLICT(notification_no) DO UPDATE SET
+                            round_id = excluded.round_id,
+                            cleaned_at = excluded.cleaned_at
+                        """,
+                        (number, round_id, now),
+                    )
+                    conn.execute(
+                        "DELETE FROM alarm_rounds WHERE id = ? AND state = 'cleaning'",
+                        (round_id,),
+                    )
+                    return {
+                        "round_id": round_id,
+                        "notification_no": number,
+                        "prior_state": row["prior_state"],
+                        "deleted": True,
+                        "complete": True,
+                        "cleanup_error": None,
+                        "state": "cleaned",
+                    }
+                if outcome.kind == "mismatch":
+                    error = outcome.detail or "通知端同号记录不属于该轮，未删除"
+                else:
+                    error = outcome.detail or "通知端失联，清理未完成"
+                conn.execute(
+                    """
+                    UPDATE alarm_rounds
+                       SET cleanup_error = ?,
+                           cleanup_attempted_at = ?,
+                           note = ?,
+                           updated_at = ?
+                     WHERE id = ?
+                    """,
+                    (
+                        error,
+                        now,
+                        f"清理未完成：{error}；两端记录未全部删除，恢复后可重试",
+                        now,
+                        round_id,
+                    ),
+                )
+                updated = conn.execute(
+                    "SELECT * FROM alarm_rounds WHERE id = ?", (round_id,)
+                ).fetchone()
+                payload = self._cleanup_payload(updated)
+                payload.update({"deleted": False, "complete": False})
+                return payload
+
     # ---------- read models ----------
 
     def _latest_window_locked(self) -> sqlite3.Row | None:
@@ -800,6 +1093,7 @@ class AlarmService:
 
     def _round_dict(self, row: sqlite3.Row) -> dict[str, Any]:
         state = str(row["state"])
+        block_reason = self.cleanup_block_reason(row)
         return {
             "id": row["id"],
             "notification_no": row["notification_no"],
@@ -818,6 +1112,11 @@ class AlarmService:
             "needs_verify": bool(row["needs_verify"]),
             "last_error": row["last_error"],
             "note": row["note"],
+            "prior_state": row["prior_state"],
+            "cleanup_error": row["cleanup_error"],
+            "cleanup_attempted_at": iso_z(row["cleanup_attempted_at"]),
+            "is_cleanable": block_reason is None,
+            "cleanup_block_reason": block_reason,
         }
 
     def get_state(self) -> dict[str, Any]:
@@ -856,6 +1155,7 @@ class AlarmService:
                 "sent": 0,
                 "skipped": 0,
                 "cancelled": 0,
+                "cleaning": 0,
             }
             for item in grouped:
                 group = GROUP_OF_STATE.get(str(item["state"]))

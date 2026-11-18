@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
-from .service import AlarmBadRequest, AlarmConflict, AlarmService
+from .service import AlarmBadRequest, AlarmConflict, AlarmNotFound, AlarmService
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
@@ -73,6 +73,10 @@ def create_app(
     async def _bad_request(_: Request, exc: AlarmBadRequest) -> JSONResponse:
         return JSONResponse(status_code=400, content={"detail": str(exc)})
 
+    @app.exception_handler(AlarmNotFound)
+    async def _not_found(_: Request, exc: AlarmNotFound) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"detail": str(exc)})
+
     @app.get("/healthz")
     def healthz(request: Request) -> dict[str, Any]:
         return {"ok": True, "worker_running": svc(request).worker_running}
@@ -104,6 +108,15 @@ def create_app(
     @app.post("/api/alarm/recover")
     def recover(request: Request) -> dict[str, Any]:
         return svc(request).recover()
+
+    @app.post("/api/rounds/{round_id}/cleanup")
+    def start_cleanup(round_id: int, request: Request) -> dict[str, Any]:
+        """Clean one recovered round on both sides; also used to retry."""
+        return svc(request).start_cleanup(round_id)
+
+    @app.post("/api/rounds/{round_id}/cleanup/retry")
+    def retry_cleanup(round_id: int, request: Request) -> dict[str, Any]:
+        return svc(request).retry_cleanup(round_id)
 
     @app.post("/api/tick")
     def tick(request: Request) -> dict[str, Any]:
