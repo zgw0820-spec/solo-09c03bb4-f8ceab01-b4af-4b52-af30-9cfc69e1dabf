@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>供电柜告警检修抑制台</title>
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>供电柜告警检修抑制台</h1>
+    <p class="sub"><span id="device-name">供电柜 #1</span> · 单设备操作 · 检修期间暂缓过热告警</p>
+  </div>
+  <div class="clock">
+    <div class="label">服务时间</div>
+    <div id="server-clock" class="mono">—</div>
+    <div id="worker-state" class="pill">—</div>
+  </div>
+</header>
+
+<main>
+  <section class="card" id="maintenance-card">
+    <div class="card-head">
+      <h2>检修窗口</h2>
+      <span id="maint-status" class="badge idle">无检修</span>
+    </div>
+    <div class="row">
+      <label for="cutoff">检修截止时刻</label>
+      <input id="cutoff" type="datetime-local" step="1">
+      <button id="set-maint" class="btn primary">设置 / 调整检修</button>
+    </div>
+    <div class="row">
+      <label>快捷设置</label>
+      <button class="btn small" data-min="1">1 分钟</button>
+      <button class="btn small" data-min="5">5 分钟</button>
+      <button class="btn small" data-min="15">15 分钟</button>
+      <button id="end-maint" class="btn small warn">立即结束检修</button>
+    </div>
+    <div id="maint-info" class="muted"></div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>告警模拟</h2>
+      <span id="active-alarm" class="badge idle">无活跃告警</span>
+    </div>
+    <div class="row">
+      <button id="trigger" class="btn danger">触发过热告警</button>
+      <button id="recover" class="btn ok">恢复告警</button>
+      <span class="muted">检修窗口内新触发的告警先抑制；截止前恢复不补送，仍活跃按本轮固定通知号送达。</span>
+    </div>
+  </section>
+
+  <section class="stats" id="stats">
+    <div class="stat suppressed"><span class="n">0</span><span class="t">抑制中</span></div>
+    <div class="stat pending"><span class="n">0</span><span class="t">待送</span></div>
+    <div class="stat sent"><span class="n">0</span><span class="t">已送</span></div>
+    <div class="stat skipped"><span class="n">0</span><span class="t">未补送</span></div>
+    <div class="stat cancelled"><span class="n">0</span><span class="t">已取消</span></div>
+  </section>
+
+  <section class="card table-card">
+    <div class="card-head">
+      <h2>告警轮次</h2>
+      <span class="muted">每轮固定通知号 · 回执丢失先按号核实 · 不重复通知</span>
+    </div>
+    <div class="table-wrap">
+      <table id="rounds">
+        <thead>
+          <tr>
+            <th>轮次</th>
+            <th>通知号</th>
+            <th>状态</th>
+            <th>触发</th>
+            <th>恢复</th>
+            <th>送达 / 核实</th>
+            <th>尝试</th>
+            <th>说明</th>
+          </tr>
+        </thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <div id="empty" class="empty muted">暂无告警轮次</div>
+  </section>
+
+  <section class="card">
+    <div class="card-head">
+      <h2>通知端观测</h2>
+      <span class="muted">仅用于核对本地模拟端已受理的固定通知号</span>
+    </div>
+    <div id="notifier-list" class="notifier-list muted">加载中…</div>
+  </section>
+</main>
+
+<div id="toast" class="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

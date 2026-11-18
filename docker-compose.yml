@@ -1,0 +1,45 @@
+services:
+  notifier:
+    build: .
+    command:
+      ["uvicorn", "app.notifier.main:app", "--host", "0.0.0.0", "--port", "8081"]
+    environment:
+      NOTIFIER_DB: /data/notifier.db
+      NOTIFIER_MODE: ${NOTIFIER_MODE:-normal}
+    volumes:
+      - notifier-data:/data
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test:
+        ["CMD", "python", "-c",
+         "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8081/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  alarm:
+    build: .
+    command:
+      ["uvicorn", "app.alarm.main:app", "--host", "0.0.0.0", "--port", "8080"]
+    environment:
+      ALARM_DB: /data/alarm.db
+      NOTIFIER_URL: http://notifier:8081
+    volumes:
+      - alarm-data:/data
+    ports:
+      - "8080:8080"
+    depends_on:
+      notifier:
+        condition: service_healthy
+    healthcheck:
+      test:
+        ["CMD", "python", "-c",
+         "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/healthz', timeout=2)"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+volumes:
+  alarm-data:
+  notifier-data:
